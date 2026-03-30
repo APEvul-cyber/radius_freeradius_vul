@@ -1,0 +1,137 @@
+**Threat Model:**
+
+- **Attack Assumption:**
+  - Classic RADIUS/UDP as per RFC 2865, without IPsec, DTLS, RadSec, or any additional transport protection.
+  - A NAS (RADIUS client) sends Access-Request packets toward a RADIUS server, which uses vendor-specific attributes (Type 26) as part of its policy (e.g., to select roles, VLANs, QoS or other authorization profiles).
+  - The deployment uses CoA/Disconnect in addition to standard Access-Request/Accept, but the concrete attack below targets Access-Request semantics defined in RFC 2865, where no attribute-level integrity protection exists.
+
+- **Attacker Capability:**
+  - On-path active network position between the NAS and the RADIUS server (e.g., via ARP spoofing, L2 compromise, or malicious router), without knowledge of the RADIUS shared secret.
+  - Can:
+    - Observe, drop, inject, and modify RADIUS packets in transit.
+    - Predict or see any Vendor-Specific attributes in Access-Request packets and rewrite them arbitrarily.
+  - Cannot:
+    - Break MD5 or guess the shared secret to forge or modify Access-Accept / -Reject / -Challenge or CoA packets (these are protected by the Response/Request Authenticator as defined in RFC 2865 and later RFC 5176).
+    - Compromise the NAS or RADIUS server host directly.
+
+---
+
+**Attack Procedure:**
+
+1. **Leverage lack of integrity on Access-Request attributes**
+
+   - Per the provided description (and RFC 2865 §3), Access-Request packets (Code 1) have a Request Authenticator that is a random nonce, not a MAC:
+     - “RFC 2865 does not define any MAC or integrity check over the Attributes field of Access-Request packets.”
+   - As stated under `control_and_mutability`:
+     - “Because Access-Request packets have no protocol-defined integrity protection over attributes in RFC 2865, any on-path entity… can add, remove, or modify Vendor-Specific attributes in requests without detection at the RADIUS protocol level.”
+   - Therefore, the attacker can freely modify or inject Type 26 (Vendor-Specific) attributes in Access-Request packets, and neither NAS nor server will detect this at the RADIUS layer.
+
+2. **Exploit vendor policy dependence on Vendor-Specific data**
+
+   - Vendor-Specific (Type 26) is explicitly designed as an extension mechanism (§5.26 of RFC 2865):
+     - “This Attribute is available to allow vendors to support their own extended Attributes not suitable for general usage.”
+     - “[T]he actual format of the information is site or application specific…”
+   - In real deployments, as captured in `policy_usage`:
+     - “In real deployments, vendors commonly use this attribute to carry proprietary policy and configuration information…”
+   - Common patterns:
+     - NAS sends vendor-specific “hint” attributes (device type, location, port profile ID, SSID profile, or requested role).
+     - RADIUS server policy uses these VSAs as conditions to decide which authorization profile (VLAN, ACLs, admin role, bandwidth) to return in Access-Accept.
+   - The server implicitly assumes these VSAs come authentically from the NAS, because RADIUS does not distinguish between NAS-supplied and attacker-modified attributes on the wire.
+
+3. **Intercept a victim’s Access-Request**
+
+   - A victim user initiates login (e.g., 802.1X / VPN / wireless).
+   - The NAS creates an Access-Request with:
+     - Standard attributes (User-Name, NAS-IP-Address, Calling-Station-Id, etc.).
+     - Possibly some Vendor-Specific attributes reflecting NAS properties or default role hints.
+   - The attacker, being on-path, intercepts this Access-Request before it reaches the server.
+
+4. **Rewrite or inject the Vendor-Specific attribute**
+
+   - The attacker modifies the intercepted Access-Request by:
+     - Adding a new Vendor-Specific attribute, or
+     - Replacing an existing Vendor-Specific attribute’s value.
+   - Example semantics (vendor-dependent but realistic):
+     - Vendor-Id: 9999 (example vendor).
+     - Vendor-Type: 1, Value: `role=admin` or `profile=corp-secure`.
+   - The base RADIUS protocol treats the VSA payload as an opaque “string”:
+     - Generic string definition (§5 of RFC 2865) allows arbitrary binary:
+       - “1–253 octets containing binary data… Strings of length zero (0) MUST NOT be sent; omit the entire attribute instead.”
+   - Since there is no MAC over Access-Request attributes, the server has no way (per RFC 2865) to distinguish an attacker-modified Vendor-Specific attribute from one the NAS legitimately generated.
+
+5. **Server accepts modified Vendor-Specific input and mis-assigns authorization**
+
+   - The RADIUS server receives the tampered Access-Request.
+   - It verifies only what RFC 2865 specifies:
+     - The shared-secret-based MD5 is not applied to Access-Requests’ Attributes, so there is no cryptographic check on the VSA.
+     - It validates the Request Authenticator as a random nonce where needed (e.g., for User-Password obfuscation), but that does not detect attribute rewriting.
+   - The server’s policy engine evaluates the Vendor-Specific attribute:
+     - For example, policy may say:
+       - “If Vendor-Specific `role=admin` and user group is X, then assign admin-level VLAN or full-privilege shell profile.”
+   - Because the attacker has introduced or escalated the role in the VSA, the server now treats this Access-Request as requesting (or matching) a high-privileged profile and returns an Access-Accept that grants elevated authorization to the victim session.
+
+6. **Response remains cryptographically valid and is honored by NAS**
+
+   - The server composes an Access-Accept with its own chosen attributes (possibly including Vendor-Specific attributes), and computes the Response Authenticator as per RFC 2865 §3:
+     - MD5 over (Code, Identifier, Length, Request Authenticator from the request, all response Attributes, and the shared secret).
+   - Because the attacker has not modified the response in transit, the Response Authenticator is valid at the NAS.
+   - The NAS applies the high-privilege attributes from the Access-Accept to the victim’s session:
+     - For example, placing the victim on a privileged VLAN, attaching a permissive ACL, or granting admin CLI priv-lvl — all based on the server’s trust in the (attacker-forged) Vendor-Specific attribute in the original Access-Request.
+
+7. **Security impact**
+
+   - The attacker has not forged an Access-Accept or broken the MD5-based authenticator; instead, they have:
+     - Exploited the absence of integrity on Access-Request attributes and the opaque, vendor-defined semantics of Type 26.
+     - Caused the RADIUS server to *legitimately* produce a high-privilege Access-Accept for the victim’s session.
+   - Impact:
+     - Privilege escalation for the victim session (elevated network or device access).
+     - Potential lateral movement / further compromise from that elevated access.
+   - Notably, this impact is cross-user / cross-role and not restricted to metadata: it affects the authorization outcome and resulting run-time privileges.
+
+---
+
+**Attack Message:**
+
+Representative tampered Access-Request (as seen by the RADIUS server after attacker modification):
+
+```json
+{
+  "Code": 1,                         // Access-Request
+  "Identifier": 90,
+  "Length": 150,
+  "Request-Authenticator": "0x5e3b8f2c1a7d9b0044a9c8e2d1f0ab12",
+  "Attributes": [
+    {
+      "Type": "User-Name",
+      "Value": "victim-user"
+    },
+    {
+      "Type": "NAS-IP-Address",
+      "Value": "10.0.0.1"
+    },
+    {
+      "Type": "Calling-Station-Id",
+      "Value": "aa:bb:cc:dd:ee:ff"
+    },
+    {
+      "Type": "Vendor-Specific",
+      "Code": 26,
+      "Length": 36,
+      "Value": {
+        "Vendor-Id": 9999,
+        "Vendor-Type": 1,
+        "Vendor-Length": 30,
+        "Vendor-Data": "role=admin"   // attacker-injected policy value
+      }
+    }
+  ]
+}
+```
+
+- All header fields are syntactically valid (Length, Code, Identifier).
+- The Request Authenticator remains a random-looking nonce; no MAC validates the attributes herein.
+- The critical element is the `Vendor-Specific` attribute: the attacker has chosen Vendor-Data (“role=admin”) according to the vendor’s documented policy semantics so that the server will map this session into an administrative or otherwise privileged profile.
+
+---
+
+**Classification:** ATTACK

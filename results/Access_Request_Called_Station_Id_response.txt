@@ -1,0 +1,103 @@
+**Threat Model:**
+
+- **Attack Assumption:**  
+  - Deployment uses classic RADIUS/UDP as per RFC 2865 (no TLS/RadSec, no IPsec).  
+  - NAS and RADIUS server share a pre‑configured secret; authentication uses PAP/CHAP or similar, but *no* Message-Authenticator or additional per-request MAC is enforced.  
+  - The RADIUS server and/or a RADIUS proxy use `Called-Station-Id` as:
+    - an authorization input for `Service-Type = Call Check` (e.g., only certain dialed numbers are allowed), and/or  
+    - routing input for “numbered realms” (RFC 2865 §2.3), deciding which home server or policy set to use.  
+  - The NAS is honest and correctly populates `Called-Station-Id` from DNIS or equivalent signaling.
+
+- **Attacker Capability:**  
+  - On-path (MITM) between NAS and RADIUS server (or between NAS and first proxy), able to observe, drop, inject, and modify UDP/1812 packets.  
+  - Cannot break MD5, does not know the RADIUS shared secret, and cannot forge User-Password from scratch.  
+  - Cannot compromise NAS or server; only manipulates packets in transit.  
+
+---
+
+**Attack Procedure:**
+
+1. **Victim initiates access / call:**
+   - A user dials or connects to a “low-privilege” or restricted destination (phone number, SSID, virtual access number, etc.) that the NAS interprets as `Called-Station-Id = "LOW-SERVICE"`.  
+   - The NAS generates an `Access-Request` containing, among other attributes:
+     - `Service-Type = Call Check` (RFC 2865 §5.6) or normal login service type.  
+     - `User-Name`, `User-Password` (obfuscated using Request Authenticator + shared secret).  
+     - `Called-Station-Id = "LOW-SERVICE"` (RFC 2865 §5.30).  
+   - The NAS chooses a random Request Authenticator as required by RFC 2865 §3 and sends the packet via UDP/1812 (RFC 2865 §3, Packet Format/transport).
+
+2. **MITM intercepts and modifies Called-Station-Id:**
+   - The attacker intercepts the `Access-Request`.  
+   - They leave the RADIUS header, Identifier, Length, Request Authenticator, and all other attributes intact, including the `User-Password`.  
+   - They *replace* the `Called-Station-Id` value with a value that is authorized for a higher-privilege or otherwise restricted destination, for example:
+     - `Called-Station-Id = "HIGH-SERVICE"` corresponding to a premium/privileged dial-in number, or  
+     - `Called-Station-Id` for a different numbered realm that maps to a more permissive RADIUS home server.  
+   - Because RFC 2865 provides no MAC or checksum over Access-Request attributes, and the Request Authenticator is not computed over attributes, the server has no cryptographic way to detect this change.
+
+3. **Server (and proxies) process the tampered attribute:**
+   - A proxy, if present, may select the home server based on the *modified* `Called-Station-Id` per RFC 2865 §2.3 (“numbered realm” behavior):
+     - The packet can be routed to a different backend RADIUS server or policy set than originally intended.  
+   - The ultimate RADIUS server receives an apparently valid `Access-Request` that:
+     - Has a plausible Request Authenticator.  
+     - Contains a valid, decodable `User-Password` that matches the shared secret with the NAS.  
+     - Presents `Called-Station-Id = "HIGH-SERVICE"` (attacker-chosen).  
+   - For `Service-Type = Call Check`, RFC 2865 §5.6 explicitly states that the server’s decision is “typically based on the Called-Station-Id or Calling-Station-Id attributes.” The server therefore:
+     - Evaluates policies that assume the user **called the high-privilege number**.  
+     - May send an `Access-Accept` where it would have sent `Access-Reject` for the true `LOW-SERVICE` number, or may assign stronger privileges (e.g., premium service, different VLAN, higher bandwidth).
+
+4. **NAS accepts the forged authorization:**
+   - The server responds with `Access-Accept` or `Access-Reject` using a valid Response Authenticator (RFC 2865 §3).  
+   - The attacker forwards the unmodified server response to the NAS; no modification of the response is required.  
+   - The NAS validates the Response Authenticator using the Request Authenticator it generated and the shared secret; this check passes because the attacker did not tamper with the response.  
+   - The NAS then:
+     - Answers the call / grants access under the **wrong policy**, believing the request pertained to the high-privilege destination implied by the tampered `Called-Station-Id`.  
+
+5. **Security impact:**
+   - **Authorization bypass:** Call Check or policy-based restrictions tied to dialed number / accessed service can be bypassed. A user calling a low-privilege or blocked number is treated as if they called a high-privilege allowed number.  
+   - **Realm / policy steering:** If `Called-Station-Id` is used for numbered realm routing, the attacker can steer authentication to a different RADIUS backend with weaker policy or test configuration while keeping the same credentials.  
+   - **Cross-policy escalation:** The attacker/user gains access to services, realms, or call types they were not meant to obtain, without needing the RADIUS shared secret or breaking MD5—only by exploiting that `Called-Station-Id` in Access-Request is mutable and unauthenticated.
+
+---
+
+**Attack Message:**
+
+Representative tampered `Access-Request` as seen by the RADIUS server (JSON-like):
+
+```json
+{
+  "Code": "Access-Request",           // 1
+  "Identifier": 0x5A,
+  "Length": 180,
+  "Request-Authenticator": "0x9f83b2a1c4d7e9f00112233445566778",
+
+  "Attributes": [
+    {
+      "Type": "User-Name",
+      "Value": "alice@example.com"
+    },
+    {
+      "Type": "User-Password",
+      "Value": "0x7c8d9e... (PAP-obfuscated with NAS secret and above Request-Authenticator)"
+    },
+    {
+      "Type": "Service-Type",
+      "Value": "Call Check"
+    },
+    {
+      "Type": "NAS-IP-Address",
+      "Value": "192.0.2.10"
+    },
+    {
+      "Type": "Called-Station-Id",
+      "Value": "HIGH-SERVICE"          // Tampered by attacker; originally "LOW-SERVICE"
+    }
+  ]
+}
+```
+
+- The only attacker modification is the `Called-Station-Id` value.  
+- All fields used in the Request and Response Authenticators (header, Request Authenticator, shared secret) remain unchanged, so cryptographic checks still succeed.  
+- The server enforces policy as if the user had called/connected to `HIGH-SERVICE`.
+
+---
+
+**Classification:** ATTACK

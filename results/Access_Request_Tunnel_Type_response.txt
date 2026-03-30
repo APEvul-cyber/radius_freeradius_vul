@@ -1,0 +1,129 @@
+**Threat Model:**
+
+- **Attack Assumption:**
+  - Classic RADIUS/UDP deployment per RFC 2865/2868, without RadSec, DTLS, IPsec, or other channel protection between NAS (tunnel initiator) and RADIUS server.
+  - Compulsory tunneling environment where:
+    - The NAS acts as a tunnel initiator and a RADIUS client.
+    - The NAS includes `Tunnel-Type` in `Access-Request` as a list of supported/desired tunnel protocols.
+    - The RADIUS server uses `Tunnel-Type` when selecting/authorizing the tunnel protocol in its `Access-Accept` (e.g., prefers L2TP/IPsec but will fall back to PPTP if requested).
+  - The tunnel protocol chosen has a meaningful security difference (e.g., PPTP vs L2TP/IPsec).
+
+- **Attacker Capability:**
+  - On-path (MITM) between NAS and RADIUS server at the IP/UDP layer:
+    - Can capture, drop, delay, and modify RADIUS `Access-Request` packets.
+    - Cannot observe or modify the shared RADIUS secret between NAS and AAA server.
+    - Cannot forge valid `Access-Accept`/`Access-Reject` packets because the Response Authenticator MD5 hash includes the shared secret.
+  - Can also act as a network MITM for the resulting tunnel (e.g., on the path between NAS and tunnel server), and thus benefits from weaker tunnel security.
+  - Does not compromise the NAS, the RADIUS server, or any RADIUS proxy; relies solely on protocol and deployment behavior.
+
+---
+
+**Attack Procedure:**
+
+1. **Legitimate client triggers an Access-Request with strong tunnel options.**  
+   - A user dials in / connects to the NAS.  
+   - The NAS, acting as a tunnel initiator and RADIUS client, builds an `Access-Request` including:
+     - `User-Name`, `NAS-IP-Address`, possibly `User-Password`.
+     - One or more `Tunnel-Type` attributes indicating *supported* or *preferred* secure tunnel(s), e.g.:  
+       - `Tunnel-Type = L2TP`  
+       - `Tunnel-Type = PPTP`  
+     - Per RFC 2868 §3.1, for a tunnel initiator these `Tunnel-Type` attributes are “a hint to the RADIUS server as to the tunnelling protocols supported by the tunnel end-point.”
+
+2. **Request Authenticator does not protect attributes.**  
+   - As per RFC 2865 §3, in `Access-Request` the Authenticator is a 16‑octet random nonce:
+     - It is **not** a MAC over the attributes.
+     - It is used for password hiding and replay protection but provides **no integrity** for `Tunnel-Type` or any other attribute.
+   - Therefore, modifying `Tunnel-Type` in transit does not invalidate any integrity check; none exists at this point for attributes.
+
+3. **MITM intercepts and modifies the Access-Request.**  
+   - The attacker captures the NAS → server `Access-Request`.  
+   - The attacker rewrites the `Tunnel-Type` attribute list to enforce a weaker tunnel, e.g.:
+     - Remove secure options (`L2TP`, `IPsec tunnel`, etc.).
+     - Insert/leave only a weaker option, such as `Tunnel-Type = PPTP` (value `1` from RFC 2868 §5/6.1).
+   - Because attributes are not integrity-protected in `Access-Request`, the RADIUS server cannot detect this modification.
+
+4. **RADIUS server processes the manipulated request.**  
+   - The RADIUS server receives the altered `Access-Request`:
+     - It sees only the attacker-selected `Tunnel-Type` value(s).
+   - Per RFC 2868 §3.1:
+     - For a tunnel initiator, `Tunnel-Type` in `Access-Request` is a *hint*; the server MAY ignore it but often uses it as input to policy.
+   - Under the assumed deployment, the server’s policy is:  
+     - “If the NAS offers both L2TP/IPsec and PPTP, prefer L2TP/IPsec. If only PPTP is indicated, authorize PPTP.”
+   - As a result, the server decides to authorize a PPTP tunnel, even though the NAS actually supports stronger protocols.
+
+5. **Server sends Access-Accept authorizing the weak tunnel.**  
+   - The server replies with `Access-Accept` containing:
+     - A `Tunnel-Type` attribute indicating the authorized protocol, here `Tunnel-Type = PPTP`.
+   - This response is protected by a Response Authenticator (MD5 over `Code+ID+Length+RequestAuth+Attributes+Secret` per RFC 2865 §3), so the attacker **cannot** modify this response without detection.
+   - However, that does not undo the earlier downgrade: the response is already based on the attacker’s manipulated `Tunnel-Type` in the request.
+
+6. **NAS establishes the weak tunnel as instructed.**  
+   - The NAS validates the Response Authenticator using its shared secret → response is accepted as legitimate.  
+   - As a tunnel initiator, per RFC 2868 §3.1 and §4, the NAS treats the `Tunnel-Type` in the `Access-Accept` as authoritative and establishes a tunnel of type PPTP to the specified tunnel server.
+   - No RFC requirement forces the NAS to compare this against its original (pre-attack) offered `Tunnel-Type`; the NAS trusts the RADIUS server’s selection.
+
+7. **Attacker exploits weaker tunnel security.**  
+   - Because the attacker is also on-path for the tunnel traffic (or can otherwise reach it), and PPTP offers weaker or broken security compared to L2TP/IPsec:
+     - The attacker can:
+       - Mount cryptographic attacks on the weaker tunnel.
+       - Perform more effective traffic inspection or manipulation.
+       - Bypass protections that would have been provided by a stronger protocol.
+   - The end result is a *material downgrade* of confidentiality/integrity for user traffic, caused entirely by undetected modification of `Tunnel-Type` in the `Access-Request`.
+
+8. **Scope and impact.**
+   - The attack is **session-scoped**: it affects each user session whose `Access-Request` the attacker can intercept and modify.
+   - There is no cross-user privilege escalation in RADIUS logic, but there is a cross-layer impact: the RADIUS control-plane attribute determines the tunnel security level, and its lack of integrity allows a downgrade attack.
+
+---
+
+**Attack Message:**
+
+Representative malicious `Access-Request` (as seen *after* attacker modification), in JSON-like form:
+
+```json
+{
+  "Code": "Access-Request",
+  "Identifier": 0x3a,
+  "Length": 180,
+  "Authenticator": "0x9f3c1a4b7e2d5c8f1122334455667788",  // random nonce, unchanged
+  "Attributes": [
+    {
+      "Type": "User-Name",
+      "Value": "alice@example.com"
+    },
+    {
+      "Type": "NAS-IP-Address",
+      "Value": "203.0.113.10"
+    },
+    {
+      "Type": "Service-Type",
+      "Value": "Framed-User"
+    },
+    {
+      "Type": "User-Password",
+      "Value": "<RADIUS-encrypted-password-by-NAS>"
+    },
+
+    // Original (secure) Tunnel-Type hints removed by attacker:
+    // { "Type": "Tunnel-Type", "Value": "L2TP" }
+    // { "Type": "Tunnel-Type", "Value": "IPsec" }
+
+    {
+      "Type": "Tunnel-Type",
+      "Vendor": "IETF",
+      "Attribute-Code": 64,
+      "Length": 6,
+      "Value": "PPTP"  // numeric value 1 per RFC 2868 §5/6.1
+    }
+  ]
+}
+```
+
+- The attacker:
+  - Preserves `Code`, `Identifier`, `Length` (updated if needed), and `Authenticator` or regenerates a valid-looking nonce.
+  - Edits only the `Tunnel-Type` attributes to restrict the offered protocol to PPTP.
+- The RADIUS server legitimately responds with an `Access-Accept` authorizing PPTP, protected by a correct Response Authenticator, so the NAS accepts it and sets up a PPTP tunnel.
+
+---
+
+**Classification:** ATTACK

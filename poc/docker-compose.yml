@@ -1,0 +1,59 @@
+version: "3.8"
+
+services:
+  # FreeRADIUS 服务器 - 配置 PAP + MAB 认证
+  freeradius:
+    build:
+      context: ./freeradius
+      dockerfile: Dockerfile
+    container_name: radius-server
+    ports:
+      - "1812:1812/udp"
+      - "1813:1813/udp"
+    networks:
+      radius-net:
+        ipv4_address: 172.20.0.10
+    healthcheck:
+      test: ["CMD", "radiusd", "-C"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # 攻击者容器 - Python + scapy 发送 PoC 数据包
+  attacker:
+    build:
+      context: ./attacker
+      dockerfile: Dockerfile
+    container_name: radius-attacker
+    depends_on:
+      - freeradius
+    networks:
+      radius-net:
+        ipv4_address: 172.20.0.20
+    volumes:
+      - ./attacker/scripts:/scripts
+    stdin_open: true
+    tty: true
+
+  # MITM 代理 - 用于 Blast-RADIUS (PoC #1) 场景
+  mitm-proxy:
+    build:
+      context: ./mitm-proxy
+      dockerfile: Dockerfile
+    container_name: radius-mitm
+    depends_on:
+      - freeradius
+    networks:
+      radius-net:
+        ipv4_address: 172.20.0.30
+    volumes:
+      - ./mitm-proxy/scripts:/scripts
+    stdin_open: true
+    tty: true
+
+networks:
+  radius-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24

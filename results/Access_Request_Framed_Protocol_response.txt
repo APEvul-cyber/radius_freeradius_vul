@@ -1,0 +1,149 @@
+**Threat Model:**
+
+- **Attack Assumption:**
+  - Classic RADIUS-over-UDP deployment as in RFC 2865 (no RadSec/TLS, no IPsec).
+  - NAS (RADIUS client) and RADIUS server share a secret; the attacker does *not* know the secret and cannot break MD5.
+  - The attacker is an on-path active network adversary between the NAS and the RADIUS server, or operates a malicious/compromised RADIUS proxy.
+  - Access-Request packets are sent in clear and are not protected by any per-packet MAC beyond the Request Authenticator being used for User-Password obfuscation (as per RFC 2865).
+  - The RADIUS server uses `Framed-Protocol` as part of its authorization/policy logic, e.g.:
+    - “Only PPP (`Framed-Protocol = 1`) users get full internal network access; others get restricted access or are rejected,” or
+    - “Users in realm X must use PPP; any other `Framed-Protocol` is rejected,” or
+    - “Apply policy/profile A vs B depending on `Framed-Protocol`.”
+
+- **Attacker Capability:**
+  - CAN:
+    - Observe, drop, delay, modify, and inject RADIUS packets between NAS and server.
+    - Modify attributes within Access-Request packets, including `Framed-Protocol`, without knowledge of the shared secret (because Access-Request attributes are not MAC-protected in RFC 2865).
+    - Forward server responses unmodified so that Response Authenticators remain valid.
+  - CANNOT:
+    - Compute or forge valid Response Authenticators for modified Access-Accept/Reject/Challenge packets.
+    - Break MD5 or guess the shared secret.
+    - Directly compromise the NAS or server configuration (beyond manipulating traffic in transit).
+
+
+---
+
+**Attack Procedure:**
+
+Goal: Use uncontrolled/mutable `Framed-Protocol` in an Access-Request to trick the RADIUS server into applying more privileged authorization/policy than it would for the true underlying session, thereby weakening authorization and network segregation.
+
+Assume a common policy pattern:
+
+- The NAS supports multiple framed protocols (e.g., PPP and SLIP).
+- The server’s policy is:
+
+  - If `Service-Type = Framed-User` and `Framed-Protocol = PPP (1)`, return `Access-Accept` with:
+    - `Filter-Id = "corp-full-access"`  
+    - (optionally) `Framed-Protocol = PPP` in the Access-Accept.
+  - If `Framed-Protocol != PPP`, either:
+    - Return `Access-Accept` with `Filter-Id = "guest-restricted"`, or
+    - Return `Access-Reject`.
+
+1. **User connects to the NAS using a “low-privilege” framing.**
+
+   - For example, the user establishes a SLIP session (or any framing that is intended to be guest/restricted).
+   - The NAS, per RFC 2865 §5.7, creates an `Access-Request` with:
+     - `Service-Type = Framed-User`
+     - `Framed-Protocol = 2` (SLIP)
+     - Other attributes: `User-Name`, `User-Password` (or CHAP/EAP equivalents), `NAS-IP-Address`, etc.
+   - The Request Authenticator is a random 16-octet value, used with the shared secret for password obfuscation, but not as a MAC over attributes.
+
+2. **Attacker intercepts and rewrites `Framed-Protocol` in the Access-Request.**
+
+   - On-path, the attacker inspects the Access-Request packet.
+   - Without modifying Code/Identifier/Length or the Request Authenticator, the attacker changes the `Framed-Protocol` value field from `0x00000002` (SLIP) to `0x00000001` (PPP).
+   - Because:
+     - The Request Authenticator is not a MAC over attributes.
+     - `Framed-Protocol` is just a 32-bit integer attribute (RFC 2865 §5).
+     - There is no Message-Authenticator in base RFC 2865.
+     - Proxies are allowed to modify attributes (RFC 2865 §2.3), so the server does not treat changes as anomalous.
+   - The modified Access-Request is then forwarded to the RADIUS server.
+
+3. **RADIUS server makes authorization decisions based on the falsified `Framed-Protocol`.**
+
+   - The server receives an Access-Request that appears to come from a legitimate NAS, with:
+     - A valid Request Authenticator.
+     - A valid User-Password (or CHAP/EAP) value consistent with that Request Authenticator and shared secret.
+     - `Framed-Protocol = PPP` (per the attacker’s modification).
+   - The server’s policy engine evaluates attributes:
+     - It sees `Service-Type = Framed-User` and `Framed-Protocol = PPP`.
+     - It applies the more privileged profile (e.g., `Filter-Id = "corp-full-access"`, more permissive ACLs, internal subnet assignment, or simply “allow” vs “reject”) that is intended only for PPP connections.
+   - The server sends an `Access-Accept` with:
+     - `Framed-Protocol = PPP` (optional, may or may not be present per server config).
+     - The more privileged associated attributes (e.g., `Filter-Id = "corp-full-access"`, `Framed-IP-Address` from a corporate pool, etc.).
+   - The Response Authenticator covers all response attributes (RFC 2865 §3), so the attacker cannot safely modify the Access-Accept without detection.
+
+4. **NAS accepts the Access-Accept and applies the privileged configuration.**
+
+   - The attacker forwards the Access-Accept unchanged to the NAS.
+   - The NAS verifies the Response Authenticator using the shared secret; it succeeds.
+   - The NAS applies the attributes from the Access-Accept to the current session. Depending on implementation:
+     - The NAS may ignore or tolerate a mismatch between the existing link layer and the server’s `Framed-Protocol` value in the response (if present), but it will still apply the IP address, ACLs, VLANs, or other policy that came with that Access-Accept.
+     - In many real setups, `Framed-Protocol` is treated as a hint/selector rather than a strict enforcement mechanism on the NAS side, while the *server* uses it as an authz discriminator.
+   - Result: a user connected via a framing that should be “guest” or “rejected” receives policy intended for PPP users, thus obtaining greater network access than the server admin intended.
+
+5. **Security impact.**
+
+   - The attacker has not forged a RADIUS response or learned the shared secret; instead, they have:
+     - Exploited the lack of integrity protection on Access-Request attributes.
+     - Leveraged the fact that `Framed-Protocol` participates in authorization decisions (policy_usage) and is mutable by any on-path adversary or proxy.
+   - This can lead to:
+     - Bypassing per-protocol authorization (e.g., “only PPP connections can reach the internal network”).
+     - Circumventing security policies that treat different link-layer framings as different trust levels.
+   - The impact is confined to sessions the attacker can intercept (their own or others’), but it is a real weakening of access control and segmentation based on framing type.
+
+
+---
+
+**Attack Message:**
+
+Representative manipulated Access-Request as seen by the RADIUS server (after attacker modification):
+
+```json
+{
+  "Code": "Access-Request",
+  "Identifier": 0x3a,
+  "Length": 138,
+  "Authenticator": "0x7f3c9e1b4a2d8c6f1122334455667788",
+  "Attributes": [
+    {
+      "Type": "User-Name",
+      "Value": "alice"
+    },
+    {
+      "Type": "User-Password",
+      "Value": "<obfuscated-with-secret-and-authenticator>"
+    },
+    {
+      "Type": "Service-Type",
+      "Value": "Framed-User"
+    },
+    {
+      "Type": "Framed-Protocol",
+      "Value": 1,
+      "Comment": "Modified by attacker from 2 (SLIP) to 1 (PPP)"
+    },
+    {
+      "Type": "NAS-IP-Address",
+      "Value": "192.0.2.10"
+    },
+    {
+      "Type": "NAS-Port",
+      "Value": 7
+    },
+    {
+      "Type": "Calling-Station-Id",
+      "Value": "dialup-line-7"
+    }
+  ]
+}
+```
+
+- The NAS originally sent `Framed-Protocol = 2` (SLIP); the attacker changed only this 32-bit integer.
+- The Request Authenticator and all other fields remain valid; the server has no protocol-level indication of tampering.
+- The server’s policy engine now evaluates the request as a PPP framed session and may assign more privileged policy accordingly.
+
+
+---
+
+**Classification:** ATTACK

@@ -1,0 +1,179 @@
+**Threat Model:**
+
+- **Attack Assumption:**
+  - Deployment uses classic RADIUS/UDP as per RFC 2865 over an unprotected network (no RadSec/TLS/IPsec).
+  - Authentication uses Access-Request / Access-Accept / Access-Reject / Access-Challenge as defined in RFC 2865, with the MD5-based Response Authenticator.
+  - RADIUS proxies are allowed; Proxy-State (Type 33) is implemented and treated as opaque by all entities except the proxy that inserted it.
+  - The server and NAS correctly implement:
+    - Copying Proxy-State from Access-Request to responses “unmodified and in order” (§2, §2.3, §5.33).
+    - Response Authenticator = MD5(Code + ID + Length + RequestAuth + Attributes + Secret) (§3).
+    - Verification of the Response Authenticator on received responses.
+
+- **Attacker Capability:**
+  - On-path active attacker between the NAS and the first RADIUS hop (server or proxy), able to:
+    - Observe, drop, delay, modify, and inject RADIUS packets.
+    - Spoof NAS source IP/UDP when talking to the RADIUS server.
+  - Does *not* know any RADIUS shared secret.
+  - Has practical capability to compute **chosen-prefix MD5 collisions** (as demonstrated in Blast-RADIUS–style attacks), i.e., can prepare two different byte strings whose MD5 values collide when a fixed secret is appended.
+  - Cannot compromise the NAS or RADIUS server host, and cannot directly read the shared secret from either endpoint.
+
+
+---
+
+## Attack Procedure:
+
+### High-level idea
+
+Exploit MD5’s chosen-prefix collision weakness in combination with:
+
+- The fact that **Proxy-State is copied verbatim from Access-Request to responses** (§2, §2.3, §5.33).
+- The fact that **Proxy-State bytes are included in the Response Authenticator hash** as part of “Attributes” (§3).
+- The lack of integrity on Access-Request packets (no packet-wide MAC; Request Authenticator is just random) (§3).
+
+Proxy-State gives the attacker a large, *completely attacker-controlled* and *semantically unconstrained* region inside the Attributes field that:
+
+1. Can be inserted/modified freely in the Access-Request (no integrity protection).
+2. Is guaranteed to be echoed into the Access-Accept/Reject/Challenge “unmodified and in order” by the remote server (§2, §2.3, §5.33).
+3. Hence appears *both* in the string hashed by the server to produce the Response Authenticator *and* in the string the NAS verifies.
+
+This makes Proxy-State an ideal carrier for the collision blocks used to convert a valid, server-signed Access-Reject into a forged Access-Accept that still passes the Response Authenticator check.
+
+---
+
+### Step-by-step attack
+
+1. **Pre-compute MD5 chosen-prefix collision material embedded in Proxy-State**
+
+   - Offline, the attacker constructs two different Proxy-State payloads:
+     - `PS_reject`: bytes that will appear in a *legitimate* Access-Request and corresponding Access-Reject.
+     - `PS_accept`: bytes that will be substituted in the forged Access-Accept.
+   - These are computed such that, when included in the overall MD5 input stream:
+
+     ```
+     ResponseAuth = MD5(Code + ID + Length + RequestAuth + Attributes + Secret)
+     ```
+
+     there is a chosen-prefix collision: the MD5 value remains the same even if:
+     - The Code changes from Access-Reject (3) to Access-Accept (2),
+     - Selected attributes differ (e.g., access-control attributes),
+     - And `PS_reject` is replaced by `PS_accept`.
+
+   - Crucially, the attacker relies on being able to place arbitrary octets in Proxy-State (defined as a String of one or more octets, implementation-dependent, §5.33) and on the fact that other parties treat it as opaque and unconstrained (§2.3, §5.33).
+
+2. **Inject or modify an Access-Request to carry `PS_reject` in Proxy-State**
+
+   - Acting as MITM between NAS and server, the attacker:
+     - Intercepts a user’s Access-Request (for a user that will be rejected, e.g., incorrect password).
+     - Modifies or appends a `Proxy-State` attribute carrying `PS_reject`, or injects a fresh Access-Request spoofed as coming from the NAS that contains `Proxy-State = PS_reject`.
+   - This is allowed because:
+     - Access-Request has no packet-wide integrity mechanism; Request Authenticator is just random (§3), and the server has no MAC to check.
+     - RFC 2865 allows zero or more Proxy-State attributes in an Access-Request (§5.44) and says their usage is implementation-dependent and opaque (§5.33).
+
+3. **Server processes the Access-Request and rejects the user**
+
+   - The RADIUS server receives the Access-Request and:
+     - Ignores the semantics of Proxy-State (treated as opaque, per §5.33).
+     - Authenticates the user and decides to **reject** (Access-Reject).
+   - According to RFC 2865:
+     - “If any Proxy-State attributes were present in the Access-Request, they MUST be copied unmodified and in order into the response packet” (§2, §2.3, §5.33).
+   - The server thus sends an Access-Reject containing:
+     - The same `Proxy-State = PS_reject`.
+     - The Response Authenticator computed as:
+
+       ```
+       RA_reject = MD5(Code=3 + ID + Length + RequestAuth + Attributes(…PS_reject…) + Secret)
+       ```
+
+4. **MITM intercepts the Access-Reject and rewrites it into an Access-Accept**
+
+   - The attacker intercepts this Access-Reject before it reaches the NAS.
+   - Using the precomputed collision structure, the attacker:
+     - Changes the header `Code` from Access-Reject (3) to Access-Accept (2).
+     - Adjusts Length and the set of authorization attributes (e.g., adds `Filter-Id = "allow-all"` or other attributes granting full network access).
+     - Replaces `Proxy-State = PS_reject` with `Proxy-State = PS_accept`.
+   - Because `PS_reject` and `PS_accept` were specially crafted for a chosen-prefix collision (and the rest of the structural differences are integrated into the collision design), the entire byte stream:
+
+     ```
+     Code + ID + Length + RequestAuth + Attributes(…PS_accept…) + Secret
+     ```
+
+     hashes via MD5 to the **same value** as the original server-signed Reject:
+
+     ```
+     MD5(Code=2+ID+...+PS_accept+Secret) = MD5(Code=3+ID+...+PS_reject+Secret) = RA_reject
+     ```
+
+   - The attacker leaves the 16-octet Response Authenticator field unchanged (still `RA_reject`).
+
+5. **NAS verifies the forged Access-Accept successfully**
+
+   - The NAS receives what appears to be a valid Access-Accept from the server:
+     - `Code = 2` (Access-Accept).
+     - Response Authenticator = `RA_reject`.
+     - Includes the attacker-chosen policy attributes (e.g., allow-all), and Proxy-State = `PS_accept`.
+   - Per RFC 2865, the NAS recomputes:
+
+     ```
+     RA_check = MD5(Code=2 + ID + Length + RequestAuth + Attributes(…PS_accept…) + Secret)
+     ```
+
+   - Due to the chosen-prefix collision, `RA_check` equals the stored 16-octet Response Authenticator, so the NAS accepts the packet as authentic and unmodified.
+   - The NAS therefore **grants access**, even though the legitimate server actually sent an Access-Reject for that user.
+
+6. **Impact**
+
+   - **Authentication bypass / privilege escalation**: A user who should be rejected can gain access with arbitrary privileges defined by attacker-chosen attributes.
+   - **Cross-user impact**: The attack is not confined to the attacker’s own account; any victim user’s Access-Request can be turned into an Access-Accept on the wire.
+   - **End-to-end integrity break**: Hop-by-hop integrity from server to NAS (via Response Authenticator) is defeated. The fundamental MD5 MAC and the protocol’s design using echoed Proxy-State are jointly exploited.
+
+   Proxy-State’s role is critical: it provides attacker-controlled bytes that:
+
+   - Are present in both Access-Request and the server’s response, copied “unmodified and in order”.
+   - Are included in the MAC input (`Attributes`).
+   - Are semantically opaque and unconstrained, ideal for inserting collision blocks without being rejected by the server or NAS.
+
+
+---
+
+## Attack Message:
+
+Representative forged Access-Accept packet as delivered to the NAS (simplified, JSON-like):
+
+```json
+{
+  "Code": 2,                         // Access-Accept (changed from 3 = Reject)
+  "Identifier": 0x5A,                // Same ID as in the original server response
+  "Length": 220,                     // Updated to reflect modified attributes
+  "Authenticator": "0x<RA_reject>",  // Unchanged: original MD5 Response Authenticator from server's Reject
+  "Attributes": [
+    {
+      "Type": "User-Name",
+      "Value": "victim-user"
+    },
+    {
+      "Type": "Proxy-State",
+      "Value": "0x<PS_accept_collision_block>" 
+      /* Attacker-controlled chosen-prefix collision data; differs from PS_reject but
+         crafted so that MD5(Code+ID+Length+RequestAuth+Attributes+Secret) is unchanged */
+    },
+    {
+      "Type": "Filter-Id",
+      "Value": "allow-all"           // Attacker-chosen authorization attribute
+    },
+    {
+      "Type": "Framed-Protocol",
+      "Value": "PPP"
+    }
+  ]
+}
+```
+
+Notes:
+
+- The *actual* collision bytes for `PS_accept_collision_block` and the precise layout of other attributes are shaped by the chosen-prefix collision construction; here they are represented abstractly.
+- The essential property is that the Proxy-State content is fully attacker-controlled and echoed verbatim by the server, allowing it to serve as MD5 collision padding while remaining syntactically valid RADIUS.
+
+
+---
+
+**Classification:** ATTACK

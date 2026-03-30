@@ -1,0 +1,7 @@
+FROM freeradius/freeradius-server:latest
+
+# 复制自定义配置
+COPY raddb/ /etc/raddb/
+
+# 以调试模式运行，方便观察认证过程
+CMD ["radiusd", "-f", "-l", "stdout", "-X"]

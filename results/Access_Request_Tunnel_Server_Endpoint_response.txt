@@ -1,0 +1,129 @@
+**Threat Model:**
+
+- **Attack Assumption:**
+  - Classic RADIUS/UDP over IP without additional transport protection (no IPsec, DTLS, or RadSec).
+  - A compulsory tunneling deployment using RFC 2868 tunnel attributes (e.g., L2TP, PPTP).
+  - The RADIUS server is configured to *honor Tunnel-Server-Endpoint provided in Access-Request as a policy hint* (e.g., “if Tunnel-Server-Endpoint is present, reflect/allow it in Access-Accept for this user/class of users”).
+  - The NAS follows RFC 2868 and will establish the tunnel to whatever Tunnel-Server-Endpoint appears in a valid Access-Accept.
+
+- **Attacker Capability:**
+  - On-path attacker between NAS (RADIUS client) and RADIUS server:
+    - Can intercept, drop, modify, and inject RADIUS packets between NAS and server.
+    - Cannot compute valid Response Authenticators without the shared secret (cannot forge server responses).
+    - Cannot break MD5, but can exploit the fact that Access-Request attributes are not MAC-protected.
+  - Attacker controls or can create a reachable tunnel server endpoint (e.g., an L2TP LNS/VPN concentrator with a routable IP or FQDN).
+
+---
+
+**Attack Procedure:**
+
+1. **User initiates tunnel-based access via NAS**
+   - A user dials in or connects to the NAS, which is configured for compulsory tunneling.
+   - NAS composes an `Access-Request` to the RADIUS server with:
+     - Usual attributes (e.g., `User-Name`, `NAS-IP-Address`, possibly `Tunnel-Type` and `Tunnel-Medium-Type`).
+     - It may include a benign `Tunnel-Server-Endpoint` hint, or none at all.
+   - Per RFC 2865 §4.1, this Access-Request “MAY contain additional attributes as a hint to the server”.
+   - The NAS sets the Request Authenticator to a random 16‑octet value (RFC 2865 §3), which is **not a MAC** over the packet.
+
+2. **Attacker intercepts and rewrites Tunnel-Server-Endpoint**
+   - As the Access-Request traverses the network, the on-path attacker intercepts it.
+   - Because RFC 2865 does *not* define any integrity/MAC over arbitrary attributes in Access-Request (only the Request Authenticator random nonce and the special handling for `User-Password`), the attacker can:
+     - Add a `Tunnel-Server-Endpoint` attribute if absent, or
+     - Replace/modify the existing one.
+   - The attacker sets:
+     - `Tunnel-Medium-Type` (if present) to IPv4 (1) or IPv6 (2), as appropriate.
+     - `Tunnel-Server-Endpoint` (Type 67) `Tag` to a small value (e.g., `0x01`) to group with other tunnel attributes (RFC 2868 §3, §3.4).
+     - `String` to the IP address or FQDN of the attacker-controlled tunnel server, conforming to the specified formats (RFC 2868 §3.4):
+       - For IPv4: dotted-decimal or FQDN.
+       - For IPv6: preferred textual form or FQDN.
+   - This modification is **undetectable** to the RADIUS server because:
+     - The Request Authenticator in Access-Request is just a random nonce (RFC 2865 §3).
+     - There is no MAC over `Attributes` in Access-Request; any attribute may be altered in transit without cryptographic detection.
+
+3. **RADIUS server processes malicious hint as policy input**
+   - The server receives the modified Access-Request and verifies credentials (e.g., PAP/CHAP/EAP) as usual.
+   - As per RFC 2868 §3.4:
+     - `Tunnel-Server-Endpoint` “MAY be included (as a hint to the RADIUS server) in the Access-Request”.
+     - If a tunnel is desired, it “MUST be included in the Access-Accept packet”.
+   - Under the assumed configuration, the server’s authorization logic:
+     - Accepts that, for this user/profile, the NAS is allowed to tunnel to any endpoint requested in `Tunnel-Server-Endpoint`, or at least does not restrict it meaningfully.
+     - Generates an `Access-Accept` that:
+       - Includes `Tunnel-Type`, `Tunnel-Medium-Type`, and
+       - Echoes or otherwise reproduces the attacker-controlled `Tunnel-Server-Endpoint` as the tunnel endpoint for the session.
+   - The server then computes the Response Authenticator as:
+     - `MD5(Code + ID + Length + RequestAuth + Attributes + Secret)` (RFC 2865 §3).
+     - The malicious `Tunnel-Server-Endpoint` is now included in the MACed Attributes field of the **response**, so subsequent tampering by intermediaries would break the Response Authenticator.
+
+4. **NAS accepts Access-Accept and establishes tunnel to attacker**
+   - The attacker forwards the unmodified Access-Accept from the server to the NAS (they cannot alter it without invalidating the Response Authenticator).
+   - NAS verifies the Response Authenticator (RFC 2865 §3), confirming the packet is from the legitimate RADIUS server.
+   - Per RFC 2868 §3.4:
+     - Since `Tunnel-Server-Endpoint` is present in `Access-Accept`, and the server signaled initiation of a tunnel, the NAS treats it as the tunnel server address.
+   - The NAS initiates the tunnel (e.g., L2TP, PPTP) to the attacker-controlled IP/FQDN given in `Tunnel-Server-Endpoint`.
+
+5. **Impact: traffic redirection and confidentiality/integrity loss**
+   - The user’s L2/L3 traffic, which would normally be tunneled to a legitimate corporate LNS/VPN concentrator, is now tunneled to the attacker’s server.
+   - The attacker is **not** required to be on-path for the tunneled data plane; compromise happens via control-plane manipulation of RADIUS attributes.
+   - Consequences:
+     - Full interception and modification of the user’s tunneled traffic (confidentiality and integrity failure at the data plane).
+     - Possible credential capture inside the tunnel (e.g., inner auth, application logins).
+     - The NAS believes it is operating under valid RADIUS authorization because the Access-Accept and its Response Authenticator are from the legitimate server; the compromise arises from the unprotected hint in the Access-Request.
+
+6. **Notes on scope and preconditions**
+   - Cross-user impact:
+     - The attacker can repeat this manipulation for any user whose Access-Request they can intercept, not just their own account.
+   - This attack relies on:
+     - Lack of Access-Request integrity protection (baseline RFC 2865 behavior).
+     - Server policy that uses `Tunnel-Server-Endpoint` from Access-Request directly or with insufficient validation/whitelisting.
+   - If the server strictly ignores client-provided tunnel endpoints or enforces a strict whitelist independent of the hint, the attack is mitigated; however, RFC 2868 explicitly allows servers to treat this attribute as a hint, making such policy a realistic (and in practice common) configuration.
+
+---
+
+**Attack Message:**
+
+A representative malicious **Access-Request** as seen by the RADIUS server after attacker modification (JSON-like):
+
+```json
+{
+  "Code": 1,                          // Access-Request
+  "Identifier": 0x5a,
+  "Length": 200,                      // illustrative
+  "RequestAuthenticator": "0x93b7c0f4ee0a6f1c9b2752098a43f3d2",
+  "Attributes": [
+    {
+      "Type": "User-Name",
+      "Value": "alice@example.com"
+    },
+    {
+      "Type": "NAS-IP-Address",
+      "Value": "192.0.2.10"
+    },
+    {
+      "Type": "Tunnel-Type",
+      "Tag": 1,
+      "Value": "L2TP"                 // encoded as per RFC 2868
+    },
+    {
+      "Type": "Tunnel-Medium-Type",
+      "Tag": 1,
+      "Value": "IPv4"                 // 1
+    },
+    {
+      "Type": "Tunnel-Server-Endpoint",
+      "Tag": 1,
+      "Value": "203.0.113.66"         // attacker-controlled LNS IP (IPv4 dotted-decimal)
+    },
+    {
+      "Type": "User-Password",
+      "Value": "<obfuscated-PAP-password>"
+    }
+  ]
+}
+```
+
+- Here, `Tunnel-Server-Endpoint` (Type 67) has been injected/overwritten by the attacker to point to `203.0.113.66`, an attacker-controlled tunnel server.
+- The server, honoring this hint, will include the same endpoint in the Access-Accept, and the NAS will establish the tunnel there.
+
+---
+
+**Classification:** ATTACK

@@ -1,0 +1,106 @@
+**Threat Model:**
+
+- **Attack Assumption:**  
+  - RADIUS is deployed per RFC 2865 over UDP/1812, without IPsec, DTLS, RadSec, or any additional integrity mechanism such as Message-Authenticator.  
+  - NAS (e.g., WLAN AP/controller, DSL BRAS, switch) and RADIUS server share a static secret and use the standard MD5-based Request/Response Authenticators.  
+  - The RADIUS server’s authorization policy differentiates users based on `NAS-Port-Type` (e.g., “Wireless-IEEE-802.11” → restricted guest VLAN; “Ethernet” → full internal VLAN).  
+  - The NAS enforces whatever policy (VLAN, ACLs, privilege attributes) is returned in Access-Accept and does not independently verify the correctness of `NAS-Port-Type`.
+
+- **Attacker Capability:**  
+  - On-path attacker between the NAS and the RADIUS server, able to sniff, drop, delay, and modify UDP packets to/from port 1812.  
+  - Does **not** know the RADIUS shared secret and does **not** break MD5 or forge Response Authenticators.  
+  - Cannot compromise the NAS or RADIUS server themselves; cannot alter NAS local configuration.  
+  - Can parse and modify arbitrary RADIUS attributes in Access-Request packets, including `NAS-Port-Type`, and recompute IP/UDP checksums.
+
+---
+
+**Attack Procedure:**
+
+1. **Observe an Access-Request from a less-trusted access medium**  
+   - A legitimate user connects via a less-trusted medium, e.g. Wi‑Fi.  
+   - The NAS sends an Access-Request to the RADIUS server containing (among others):
+     - `User-Name`
+     - `User-Password` (MD5-“hidden” per RFC 2865 §5.2)
+     - `NAS-IP-Address` or `NAS-Identifier`
+     - `NAS-Port-Type = 19` (Wireless-IEEE-802.11)  
+   - The Request Authenticator is a 16-octet random value. There is **no** MAC over the whole packet; only the User-Password uses the shared secret.
+
+2. **Modify `NAS-Port-Type` in transit**  
+   - The attacker intercepts the Access-Request and parses the attributes.  
+   - The attacker replaces:
+     - `NAS-Port-Type = 19` (Wireless-IEEE-802.11)  
+       **with**  
+       `NAS-Port-Type = 15` (Ethernet)  
+   - The attacker updates the RADIUS `Length` (if necessary) and IP/UDP checksums.  
+   - The Request Authenticator is left unchanged; the attacker does not and need not touch it.  
+   - Because RFC 2865 defines no integrity protection for Access-Request (other than password hiding), this change is **undetectable** at the RADIUS protocol level by the server.
+
+3. **Server consumes falsified port type and applies higher-privilege policy**  
+   - The RADIUS server receives the modified Access-Request and validates the user’s credentials in the normal way (User-Password de-hiding using Secret + Request Authenticator).  
+   - The server’s authorization rules consider `NAS-Port-Type` as an input, for example:
+     - If `NAS-Port-Type == 19` → guest VLAN, restricted ACLs.  
+     - If `NAS-Port-Type == 15` → internal VLAN, full corporate ACLs.  
+   - Since the packet now contains `NAS-Port-Type = 15`, the server matches the “wired/internal” rule and generates an Access-Accept with attributes granting higher privilege, e.g.:
+     - `Tunnel-Type`, `Tunnel-Medium-Type`, `Tunnel-Private-Group-ID` for an internal VLAN  
+     - Or elevated privilege attributes / role names.  
+   - The server calculates the Response Authenticator per RFC 2865 §3:  
+     `ResponseAuth = MD5(Code + ID + Length + RequestAuth + Attributes + Secret)`  
+     This calculation depends on the (unchanged) Request Authenticator and the response attributes, but **not** on the original Access-Request attributes such as `NAS-Port-Type`.
+
+4. **Forward unmodified Access-Accept back to the NAS**  
+   - The attacker forwards the Access-Accept unchanged to the NAS.  
+   - The NAS validates the Response Authenticator using the shared secret and the Request Authenticator it originally sent. Validation succeeds, because the attacker never altered either and the server is legitimate.  
+   - The NAS reads the authorization attributes (e.g. internal VLAN / high-privilege role) and configures the user’s session accordingly on the actual port (still wireless).
+
+5. **Security impact**  
+   - The user authenticated over a **less-trusted medium** (e.g., wireless guest SSID), but due to the falsified `NAS-Port-Type`, received the **authorization policy intended for a more-trusted medium** (e.g., wired corporate access).  
+   - The attacker has thus:
+     - Caused a **policy misbinding** between physical access medium and authorization result.  
+     - Enabled **privilege escalation** for the victim user’s session (stronger VLAN, broader ACLs, higher privilege) without knowing credentials, secrets, or forging Authenticators.  
+   - The attack can be repeated for any Access-Request the attacker can intercept, affecting multiple users, but remains scoped to sessions whose requests traverse the attacker’s vantage point.
+
+---
+
+**Attack Message:**
+
+Representative modified Access-Request as seen by the RADIUS server (JSON-like, illustrative fields only):
+
+```json
+{
+  "Code": 1,                         // Access-Request
+  "Identifier": 90,
+  "Length": 120,
+  "Authenticator": "b7e3c4f8a29d1c3e0f4b12a6d8c9e0f1",
+  "Attributes": [
+    {
+      "Type": 1,
+      "Name": "User-Name",
+      "Value": "alice@example.com"
+    },
+    {
+      "Type": 2,
+      "Name": "User-Password",
+      "Value": "<16-octet MD5-hidden password>"
+    },
+    {
+      "Type": 4,
+      "Name": "NAS-IP-Address",
+      "Value": "10.0.0.10"
+    },
+    {
+      "Type": 61,
+      "Name": "NAS-Port-Type",
+      "OriginalValue": 19,
+      "Value": 15
+      // 19 (Wireless-IEEE-802.11) changed by attacker to 15 (Ethernet)
+    }
+    // ...other attributes as sent by the NAS...
+  ]
+}
+```
+
+The only security-relevant modification is the change of `NAS-Port-Type` from 19 to 15; the Request Authenticator and all cryptographically checked elements remain consistent, so neither NAS nor server detect tampering under RFC 2865 alone.
+
+---
+
+**Classification:** ATTACK

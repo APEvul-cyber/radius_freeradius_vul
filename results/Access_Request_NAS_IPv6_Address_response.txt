@@ -1,0 +1,117 @@
+**Threat Model:**
+
+- **Attack Assumption:**
+  - RADIUS/UDP on port 1812 as in RFC 2865, without IPsec, RadSec (TLS), or any outer integrity protection.
+  - Deployment supports an IPv6 NAS address attribute (e.g., NAS-IPv6-Address as per later extensions such as RFC 3162) and uses it similarly to NAS-IP-Address:
+    - Present in Access-Request only.
+    - Used for per-NAS authorization, accounting, or policy (e.g., “only NAS X may offer SSID Y”, “users in group G can connect only via NAS set N”).
+  - RADIUS server enforces such policy based on NAS-IPv6-Address, not solely on the UDP source IP / client configuration.
+  - The deployment otherwise follows RFC 2865 behavior: no MAC on Access-Request; Response Authenticator only protects responses.
+
+- **Attacker Capability:**
+  - On-path attacker between NAS and RADIUS server (e.g., compromised router/switch, malicious ISP segment).
+  - Can observe, drop, reorder, and arbitrarily modify RADIUS packets in transit.
+  - Does *not* know the shared secret and cannot break MD5; cannot forge valid Response Authenticators out of thin air.
+  - Does *not* control the NAS or RADIUS server; only the network path.
+  - Users connect to a legitimate but less-privileged NAS_B; attacker wants them to gain privileges reserved for a different NAS_A.
+
+---
+
+**Attack Procedure:**
+
+1. **Baseline protocol behavior (per RFC 2865):**
+   - A NAS, acting as RADIUS client, sends an Access-Request (Code 1) to the server with:
+     - A random 16-octet Request Authenticator (§3).
+     - Attributes including User-Name, User-Password, and a NAS identification attribute (here, NAS-IPv6-Address by analogy to NAS-IP-Address from §5.4).
+   - RFC 2865 does *not* define a message-wide MAC for Access-Request. The Request Authenticator in Access-Request is only used as a nonce in the User-Password hiding algorithm (§3, §5.2), not to authenticate the packet.
+   - Proxies/forwarders are explicitly allowed to modify most attributes to enforce local policy (§2.3); the server MAY ignore unknown attribute Types (§5).
+
+2. **Victim session setup on an “unauthorized” NAS_B:**
+   - A user connects to NAS_B, which is *not* supposed to offer certain high-privilege services (e.g., a premium SSID or restricted VLAN).
+   - NAS_B constructs an Access-Request to the RADIUS server:
+     - Source IP: IP_B.
+     - Attributes:
+       - User-Name = "alice"
+       - User-Password (obfuscated using Request Authenticator and shared secret S_B)
+       - NAS-IPv6-Address = `2001:db8:b::1` (real IPv6 address of NAS_B)
+       - Other attributes (Calling-Station-Id, Service-Type, etc.)
+   - NAS_B sends this Access-Request in a UDP packet to the server.
+
+3. **On-path modification of NAS-IPv6-Address:**
+   - The attacker intercepts the Access-Request in transit.
+   - Without touching the Request Authenticator or User-Password, the attacker rewrites **only** the NAS-IPv6-Address attribute to impersonate a more privileged NAS_A:
+     - NAS-IPv6-Address = `2001:db8:a::1` (IPv6 address of NAS_A).
+   - The attacker fixes the RADIUS Length field to reflect the unchanged overall size (if needed) and forwards the modified packet to the server.
+
+   Key points:
+   - Since Access-Request has no integrity protection under RFC 2865 (§3), this change is undetectable at the RADIUS layer.
+   - The User-Password remains valid because it is tied to the Request Authenticator and secret S_B, neither of which are modified.
+
+4. **Server processing and policy misclassification:**
+   - The RADIUS server receives the modified Access-Request from IP_B and processes it:
+     - It uses the configured client entry corresponding to IP_B (with secret S_B) to decrypt User-Password and authenticate "alice". This succeeds, because the attacker did not change password-related fields.
+     - The server’s authorization/policy engine now evaluates attributes in the *modified* request, including the forged NAS-IPv6-Address = `2001:db8:a::1`.
+   - If server policy is written like:
+     - “If NAS-IPv6-Address = 2001:db8:a::1 and user in group ‘premium’, then authorize VLAN 100 / high-privilege access.”
+     - “Otherwise, deny or assign VLAN 10.”
+   - The server concludes that this request is from NAS_A, not NAS_B, and applies the policy for NAS_A:
+     - It sends an Access-Accept with attributes corresponding to high privilege (e.g., Tunnel-Private-Group-Id, Filter-Id, etc.).
+
+5. **Response validation and application by NAS_B:**
+   - The Access-Accept includes a Response Authenticator computed as:
+     - MD5(Code + ID + Length + RequestAuth + Attributes + Secret) (§3).
+   - Because:
+     - The attacker did not alter the response.
+     - The server used Secret S_B for IP_B.
+     - NAS_B verifies the Response Authenticator using S_B successfully.
+   - NAS_B accepts the Access-Accept as valid and applies the high-privilege configuration (VLAN 100, ACLs, QoS, etc.) to the user’s session, even though policy intended such access only when coming from NAS_A.
+
+6. **Resulting security impact:**
+   - **Authorization bypass:** Users connected to NAS_B receive privileges reserved for NAS_A, violating per-NAS access controls.
+   - **Misleading accounting / logging:** The RADIUS server logs and accounting data show the session as originating from NAS_A’s IPv6 address, obscuring the real NAS and complicating incident response.
+   - **No need to break MD5 or know the shared secret:** The attack exploits the lack of integrity protection on Access-Requests and the fact that NAS-IPv6-Address is mutable on-path and may be relied upon for policy decisions.
+
+   This effect is specific to attributes that encode NAS identity and are used in authorization logic. NAS-IPv6-Address, when used analogously to NAS-IP-Address (§5.4), therefore presents a realistic avenue for per-NAS policy bypass under the stated assumptions.
+
+---
+
+**Attack Message:**
+
+Representative forged Access-Request as seen by the RADIUS server after on-path modification (pseudo-JSON for clarity):
+
+```json
+{
+  "Code": 1,                       // Access-Request
+  "Identifier": 0x5a,
+  "Length": 150,
+  "Authenticator": "0x93b4c1a2e7f9d0c4a1b2c3d4e5f60718",
+  "Attributes": [
+    {
+      "Type": "User-Name",
+      "Value": "alice"
+    },
+    {
+      "Type": "User-Password",
+      "Value": "0x4f8a7c1d..."  // Obfuscated with Request Authenticator + secret S_B
+    },
+    {
+      "Type": "NAS-IPv6-Address",
+      "Value": "2001:db8:a::1"  // FORGED: real NAS_B address was 2001:db8:b::1
+    },
+    {
+      "Type": "Calling-Station-Id",
+      "Value": "aa-bb-cc-dd-ee-ff"
+    },
+    {
+      "Type": "Service-Type",
+      "Value": "Framed-User"
+    }
+  ]
+}
+```
+
+The only change the attacker made versus the NAS_B-originated packet is the value of `NAS-IPv6-Address`. This is sufficient to cause the server to misclassify the requesting NAS and apply incorrect policy, while all cryptographic checks (User-Password deobfuscation and Response Authenticator) still succeed.
+
+---
+
+**Classification:** ATTACK

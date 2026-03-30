@@ -1,0 +1,111 @@
+**Threat Model:**
+
+- **Attack Assumption:**  
+  - RADIUS is running over UDP without IPsec or any additional transport protection.  
+  - The deployment uses RADIUS/EAP (e.g., 802.1X, WPA-Enterprise) so that Access-Request packets carry EAP-Message and do **not** contain User-Password/CHAP-Password/ARAP-Password.  
+  - The NAS and RADIUS server are legacy or misconfigured so that:
+    - Access-Requests containing EAP-Message do **not** include Message-Authenticator (Type 80), **and/or**
+    - The server does **not** enforce the RFC3579 requirement to silently discard such packets.
+  - The RADIUS server is configured to trust requests from one or more NAS IP addresses; no additional link-layer or host-level controls prevent an attacker from sending packets with that source IP.
+
+- **Attacker Capability:**  
+  - Can send arbitrary RADIUS packets to the RADIUS server with a spoofed source IP address matching a configured NAS, or from a host located at that IP (e.g., on the same L2 segment or via misconfigured routing).  
+  - Does **not** know the RADIUS shared secret and cannot forge valid Message-Authenticator values.  
+  - Does **not** control or observe the link between the legitimate NAS and its peers (i.e., no MITM at the access port).  
+  - Can run arbitrary EAP client logic locally (to generate EAP-Response messages), and can parse and respond to server EAP-Request messages that arrive encapsulated in RADIUS.
+
+---
+
+**Attack Procedure:**
+
+1. **Leverage lack of per-packet authentication for EAP-Message in Access-Request**  
+   - Per RFC2865 §3, the Request Authenticator in an Access-Request is just a 16-octet random value; by itself it does **not** authenticate the NAS or integrity-protect the attributes.  
+   - Per RFC3579 §3.1–§3.3, when an Access-Request carries EAP-Message and no User-Password/CHAP-Password/ARAP-Password, NAS identity and packet integrity are supposed to rely on Message-Authenticator.  
+   - In this misconfigured deployment, Access-Requests with EAP-Message either:
+     - Do not contain Message-Authenticator, or  
+     - Contain it but the server does not verify or require it.  
+   - As a result, nothing cryptographically binds the EAP-Message (or any other attributes) in the Access-Request to a party that knows the RADIUS shared secret.
+
+2. **Attacker masquerades as a NAS and initiates RADIUS/EAP**  
+   - The attacker constructs an initial RADIUS Access-Request packet with:
+     - Code = 1 (Access-Request), a chosen Identifier, a random Request Authenticator.  
+     - Attributes including:
+       - NAS-IP-Address (spoofed to the IP of a configured NAS).  
+       - User-Name (any target identity or attacker-controlled identity).  
+       - One or more EAP-Message attributes that, concatenated, encode an EAP-Response/Identity from a supposed peer (RFC3579 §3.1).  
+     - **No Message-Authenticator attribute.**  
+   - Because the server is configured to trust that NAS-IP-Address and does not enforce Message-Authenticator for EAP-Message, it accepts the Access-Request as coming from a legitimate NAS and processes the encapsulated EAP-Response/Identity.
+
+3. **Server drives an EAP conversation with the attacker-as-NAS**  
+   - The RADIUS server responds with an Access-Challenge containing:  
+     - EAP-Message with an EAP-Request (e.g., an EAP-TTLS, PEAP, or EAP-MD5 challenge).  
+     - Message-Authenticator may be present and valid here, but this protects only the server → NAS direction.  
+   - The attacker, acting as the “NAS,” receives the Access-Challenge, extracts the EAP-Request from EAP-Message, and feeds it into an EAP client implementation under his control.
+
+4. **Attacker completes EAP as a rogue client via RADIUS/EAP**  
+   - For each Access-Challenge from the server:
+     - The attacker’s local EAP client calculates the corresponding EAP-Response (e.g., responding to a tunnel setup, challenge, or credential prompt) using attacker-chosen credentials or guessed passwords.  
+     - The attacker encapsulates that EAP-Response in one or more EAP-Message attributes within a new Access-Request, again:
+       - Spoofing NAS-IP-Address as the trusted NAS.  
+       - Omitting Message-Authenticator.  
+   - The server accepts each Access-Request, since it has no way to distinguish it from a legitimate NAS message when Message-Authenticator is not enforced.
+
+5. **Resulting security impact**  
+   Depending on how the RADIUS deployment is used, this yields:
+
+   - **Unauthorized NAS capability / rogue authenticator:**  
+     The attacker effectively becomes a NAS that the server fully trusts, without possessing the RADIUS shared secret—contrary to the intended AAA trust model. This allows the attacker to:  
+     - Perform arbitrary EAP authentications against the backend (including for arbitrary user identities).  
+     - Receive full authorization results (Access-Accept with attributes such as VLAN, Filter-Id, or tunnel attributes).
+
+   - **Exposure of keying material for 802.1X/WPA-Enterprise:**  
+     In 802.1X/WPA-Enterprise, the RADIUS server can send MS-MPPE-Recv-Key/MS-MPPE-Send-Key or EAP-derived keying material in an Access-Accept to the NAS. Because the server believes the attacker is a legitimate NAS, these keys are delivered to the attacker.  
+     - The attacker can then use these keys to impersonate a legitimate authenticator or station, or to set up rogue APs with keys intended only for real infrastructure devices.
+
+   - **Amplified online guessing against weak EAP methods:**  
+     For methods vulnerable to online guessing (e.g., EAP-MD5, PEAP/MSCHAPv2), the attacker can:  
+     - Initiate a large number of EAP sessions, each time encapsulating attacker-chosen EAP-Responses in EAP-Message.  
+     - Observe Access-Accept vs Access-Reject to validate guesses.  
+     - Do this at scale without controlling any actual access port, purely over RADIUS.
+
+   In all cases, the root cause is that EAP-Message in Access-Request is **fully attacker-controlled** and not integrity-protected when Message-Authenticator is absent or not enforced, so the server has no cryptographic assurance that the EAP conversation is coming from a configured, trusted NAS.
+
+---
+
+**Attack Message:**
+
+Representative attacker-crafted initial Access-Request (NAS → server), showing the critical absence of Message-Authenticator and attacker-controlled EAP-Message:
+
+```json
+{
+  "Code": 1,                          // Access-Request
+  "Identifier": 37,
+  "Length": 120,
+  "Authenticator": "0x9f3c4a1b2e7d8899aa55cc3311223344",  // random; not a MAC
+  "Attributes": [
+    {
+      "Type": "NAS-IP-Address",
+      "Value": "192.0.2.10"           // IP of a NAS that the server trusts
+    },
+    {
+      "Type": "User-Name",
+      "Value": "victim@example.com"   // or attacker-controlled identity
+    },
+    {
+      "Type": "EAP-Message",
+      "Value": "0x0201000f0176696374696d406578616d706c652e636f6d"
+      // EAP-Response/Identity:
+      //   Code=2 (Response), Identifier=1,
+      //   Length=0x000f, Type=1 (Identity), Data="victim@example.com"
+      //   (encoded over one or more EAP-Message attributes; here only one)
+    }
+    // NOTE: Deliberately no Message-Authenticator (Type 80) attribute
+  ]
+}
+```
+
+If the server accepts this packet without requiring and verifying a Message-Authenticator (contra RFC3579 §3.1–§3.3), the attacker has successfully initiated an EAP conversation as a spoofed NAS using fully attacker-controlled EAP-Message content.
+
+---
+
+**Classification:** ATTACK

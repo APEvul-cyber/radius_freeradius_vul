@@ -1,0 +1,152 @@
+**Threat Model:**
+
+- **Attack Assumption**
+  - Classic RADIUS/UDP as per RFC 2865/2868.
+  - No packet-wide integrity for Access-Request:
+    - No Message-Authenticator (RFC 2869).
+    - No RadSec/TLS, DTLS, or IPsec between NAS and RADIUS server.
+  - The deployment uses tunnel attributes for compulsory tunneling / VPN-style access:
+    - `Tunnel-Private-Group-ID` from Access-Request is used as a *policy input* by the RADIUS server to assign the user to a VRF/VPN/customer group (e.g., wholesale access, L2TP, or similar).
+    - The server either honors the NAS-supplied group or strongly biases its decision based on that value.
+  - Normal RADIUS shared secret is configured between NAS and server, but only used as specified in RFC 2865 (User-Password hiding, Response Authenticator), not for Access-Request integrity.
+
+- **Attacker Capability**
+  - On-path attacker between NAS and RADIUS server (e.g., same L2 segment, compromised router, or BGP hijack) who can:
+    - Observe, drop, and modify Access-Request packets from NAS to server.
+    - Relay responses server→NAS without modification or with only benign changes.
+  - The attacker:
+    - Cannot break MD5 or guess the shared secret.
+    - Cannot directly forge valid Access-Accept packets out of thin air.
+    - Is either:
+      - A normal subscriber whose PPP/tunnel traffic triggers an Access-Request, or
+      - In a position to tamper with Access-Requests for some other subscribers’ sessions.
+
+---
+
+**Attack Procedure:**
+
+1. **Legitimate session initiation**
+   - A user (attacker or victim) starts a PPP/L2TP/other access session that causes the NAS to construct an `Access-Request` as per RFC 2865 §4.1.
+   - The NAS sets:
+     - `Code = 1` (Access-Request).
+     - A random `Request Authenticator` (RFC 2865 §3).
+   - It includes standard attributes such as `User-Name`, `User-Password`, `NAS-IP-Address`, and tunnel-related attributes (e.g., `Tunnel-Type`, `Tunnel-Medium-Type`).
+   - Depending on configuration, the NAS either:
+     - Omits `Tunnel-Private-Group-ID`, or
+     - Sets it to a non-privileged group (e.g., `retail-internet`).
+
+2. **On-path modification of `Tunnel-Private-Group-ID`**
+   - The attacker intercepts this Access-Request in transit.
+   - Because the Request Authenticator in Access-Request is *not* a MAC over attributes (RFC 2865 §3: it is just a random nonce used for password hiding), there is no protocol-level integrity check covering `Tunnel-Private-Group-ID`.
+   - The attacker edits the packet:
+     - If absent: adds a `Tunnel-Private-Group-ID` attribute (Type 81).
+     - If present: rewrites its String value.
+   - Example change:
+     - From: `Tunnel-Private-Group-ID = "retail-internet"`
+     - To: `Tunnel-Private-Group-ID = "corp-vpn-finance"`
+
+3. **Forwarding to the RADIUS server**
+   - The attacker forwards the modified Access-Request to the server, preserving:
+     - Source IP/port of the NAS (e.g., via spoofing or transparent MITM).
+     - The original `Request Authenticator`.
+     - The `User-Password` attribute (unchanged), which remains correctly protected via MD5(secret + Request Authenticator) as in RFC 2865 §5.2.
+   - Because the shared secret and Request Authenticator are unchanged, the server:
+     - Successfully recovers the user’s password from `User-Password`.
+     - Successfully verifies any password-based authentication.
+   - There is no mandatory integrity check that would fail due to the changed `Tunnel-Private-Group-ID`.
+
+4. **Server-side authorization decision**
+   - Per RFC 2868 §3.6, `Tunnel-Private-Group-ID` “indicates the group ID for a particular tunneled session” and is meant to associate the session with “a particular group of users,” e.g., for routing via a particular interface.
+   - In the assumed deployment, the server’s policy is of the form:
+     - If `Tunnel-Private-Group-ID = "corp-vpn-finance"`, then:
+       - Return tunnel attributes placing the user into the `corp-vpn-finance` VRF/VPN.
+     - Else:
+       - Place the user into a default or less privileged group.
+   - The server therefore:
+     - Accepts the user’s credentials.
+     - Treats the *attacker-modified* `Tunnel-Private-Group-ID` as the requested or authoritative group.
+     - Issues an `Access-Accept` with tunnel attributes corresponding to the high-privilege group.
+
+5. **Response and integrity in the server→NAS direction**
+   - The server constructs the `Response Authenticator` as per RFC 2865 §3:
+     - `MD5(Code + Identifier + Length + RequestAuth + Attributes + Secret)`.
+   - This includes the `Tunnel-Private-Group-ID` in the Access-Accept, so any later modification server→NAS would be detected by the NAS.
+   - The attacker forwards the Access-Accept unmodified back to the NAS.
+
+6. **NAS enforcement and privilege escalation**
+   - The NAS validates the Response Authenticator (shared secret known only to NAS and server) and accepts the Access-Accept as authentic.
+   - It applies the returned tunnel attributes and group assignment:
+     - Assigns the session to the VRF/VPN / private group corresponding to `corp-vpn-finance`.
+   - The attacker’s or victim’s session now has:
+     - Network visibility and reachability of a more privileged or otherwise isolated private group (e.g., corporate VPN, another customer’s VPN, internal management network), despite not being authorized for that group.
+   - This is a concrete authorization bypass / isolation failure:
+     - Caused directly by the ability to tamper with `Tunnel-Private-Group-ID` in an Access-Request, which is not integrity-protected in the base protocol.
+
+7. **Potential variants**
+   - **Cross-tenant pivoting in wholesale access**:
+     - Wholesale L2TP / DSL: each downstream retail ISP has its own `Tunnel-Private-Group-ID` used for accounting and routing.
+     - Attacker modifies the attribute to route their traffic through another ISP’s tunnel, potentially bypassing filters or gaining access to internal routes.
+   - **Abuse of accounting records**:
+     - Modifying `Tunnel-Private-Group-ID` in `Accounting-Request (Start/Stop)` (if not integrity-protected) can poison accounting data, misattributing usage to other tenants/groups (less critical than direct data-plane access, but still a material integrity impact).
+
+---
+
+**Attack Message:**
+
+Representative modified Access-Request (attacker-tampered) in a JSON-like form:
+
+```json
+{
+  "Code": 1,                     // Access-Request
+  "Identifier": 0x3A,
+  "Length": 220,
+  "Request-Authenticator": "0x9f3a2b47d1c983e4a6b50123ccddeeff",
+  "Attributes": [
+    {
+      "Type": "User-Name",
+      "Value": "alice@example.com"
+    },
+    {
+      "Type": "User-Password",
+      "Value": "0x5f8a... (RADIUS-encrypted per RFC 2865 §5.2)"
+    },
+    {
+      "Type": "NAS-IP-Address",
+      "Value": "198.51.100.10"
+    },
+    {
+      "Type": "NAS-Port",
+      "Value": 1234
+    },
+    {
+      "Type": "Tunnel-Type",
+      "Tag": 1,
+      "Value": "L2TP"
+    },
+    {
+      "Type": "Tunnel-Medium-Type",
+      "Tag": 1,
+      "Value": "IP"
+    },
+
+    // *** Attacker-modified attribute ***
+    {
+      "Type": "Tunnel-Private-Group-ID",     // Type 81
+      "Tag": 1,
+      "Value": "corp-vpn-finance"            // originally absent or "retail-internet"
+    }
+
+    // ...other attributes as originally sent by the NAS...
+  ]
+}
+```
+
+Processing outcome:
+
+- Server treats this as a legitimate Access-Request from NAS `198.51.100.10` with valid credentials for `alice@example.com`.
+- Server policy maps `Tunnel-Private-Group-ID = "corp-vpn-finance"` to a privileged tunnel/VRF and returns corresponding Access-Accept.
+- NAS, trusting server’s decision and protected by the Response Authenticator, puts the session into the privileged group.
+
+---
+
+**Classification:** ATTACK

@@ -1,0 +1,30 @@
+# authorize 文件 - 用户认证和策略
+# ============================================================
+
+# --- 基础用户 ---
+# 用于多数 PoC 的通用测试用户
+alice       Cleartext-Password := "password123"
+jdoe        Cleartext-Password := "password123"
+test        Cleartext-Password := "test"
+guestuser01 Cleartext-Password := "guestpass"
+
+# --- PoC: MAB 设备 (v1 遗留) ---
+001a2b3c4d5e    Cleartext-Password := "001a2b3c4d5e"
+                Service-Type = Call-Check,
+                Tunnel-Type = VLAN,
+                Tunnel-Medium-Type = IEEE-802,
+                Tunnel-Private-Group-Id = "100"
+
+aabbccddeeff    Cleartext-Password := "aabbccddeeff"
+                Service-Type = Call-Check,
+                Tunnel-Type = VLAN,
+                Tunnel-Medium-Type = IEEE-802,
+                Tunnel-Private-Group-Id = "999"
+
+# --- CHAP 用户 (PoC: CHAP-Password) ---
+# CHAP 需要明文密码存储
+chapuser    Cleartext-Password := "weakpass123"
+
+# 默认拒绝
+DEFAULT     Auth-Type := Reject
+            Reply-Message = "Access Denied - Unknown user"
