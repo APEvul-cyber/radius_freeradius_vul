@@ -1,5 +1,14 @@
-# sites-enabled/default - 自定义虚拟服务器
-# 实现基于多种属性的差异化授权策略，用于 PoC 验证
+# PacketFence-style RADIUS policy simulation
+# =============================================
+# Simulates PacketFence's pf::Connection::identifyType() behavior:
+#   NAS-Port-Type → connection_type → VLAN assignment
+#
+# Source evidence: PacketFence lib/pf/Connection.pm line ~120:
+#   $self->transport($nas_port_type =~ /^wireless/i ? "Wireless" : "Wired");
+#
+# Then in lib/pf/radius.pm line ~163:
+#   if (($connection_type & $WIRELESS) == $WIRELESS) { ... }
+#   → Different VLAN/role assignment for wired vs wireless
 
 server default {
 
@@ -16,14 +25,11 @@ listen {
 }
 
 authorize {
-    # 标准模块
     filter_username
     preprocess
     chap
     suffix
     files
-
-    # 设置 PAP 为默认认证方式
     pap
 }
 
@@ -36,53 +42,58 @@ authenticate {
     }
 }
 
-# 核心：基于属性的差异化授权策略
 post-auth {
 
-    # ========================================
-    # PoC: Called-Station-Id 策略
-    # 基于 Called-Station-Id 区分服务级别
-    # ========================================
+    # ========================================================
+    # PacketFence-style policy: NAS-Port-Type → VLAN assignment
+    # ========================================================
+    # This mirrors PacketFence's actual behavior:
+    #   Wired (Ethernet/15) → corporate VLAN 10, full access
+    #   Wireless (Wireless-802.11/19) → guest VLAN 999, restricted
+    #
+    # PacketFence source: lib/pf/Connection.pm identifyType()
+    # uses NAS-Port-Type from Access-Request to determine
+    # transport type, which drives VLAN/role assignment.
+
+    if (&NAS-Port-Type == Ethernet) {
+        # Wired connection → corporate network
+        update reply {
+            Tunnel-Type := VLAN
+            Tunnel-Medium-Type := IEEE-802
+            Tunnel-Private-Group-Id := "10"
+            Filter-Id := "corporate-full-access"
+            Reply-Message := "PacketFence-style: Wired access → VLAN 10 (corporate)"
+        }
+    }
+    elsif (&NAS-Port-Type == "Wireless-802.11") {
+        # Wireless connection → guest network
+        update reply {
+            Tunnel-Type := VLAN
+            Tunnel-Medium-Type := IEEE-802
+            Tunnel-Private-Group-Id := "999"
+            Filter-Id := "guest-restricted"
+            Reply-Message := "PacketFence-style: Wireless access → VLAN 999 (guest)"
+        }
+    }
+
+    # ========================================================
+    # Also simulate Called-Station-Id and Tunnel-* policies
+    # for other PoC tests
+    # ========================================================
+
     if (&Called-Station-Id == "HIGH-SERVICE") {
         update reply {
             Reply-Message := "HIGH-SERVICE access granted"
             Filter-Id := "allow-all"
-            Service-Type := Framed-User
         }
     }
     elsif (&Called-Station-Id == "LOW-SERVICE") {
         update reply {
             Reply-Message := "LOW-SERVICE access - restricted"
             Filter-Id := "restricted"
-            Service-Type := Framed-User
         }
     }
 
-    # ========================================
-    # PoC: NAS-Port-Type 策略
-    # Ethernet(15) → 内网权限, Wireless(19) → 访客权限
-    # ========================================
-    if (&NAS-Port-Type == Ethernet) {
-        update reply {
-            Tunnel-Type := VLAN
-            Tunnel-Medium-Type := IEEE-802
-            Tunnel-Private-Group-Id := "10"
-            Reply-Message := "Wired access - internal VLAN 10"
-        }
-    }
-    elsif (&NAS-Port-Type == "Wireless-802.11") {
-        update reply {
-            Tunnel-Type := VLAN
-            Tunnel-Medium-Type := IEEE-802
-            Tunnel-Private-Group-Id := "999"
-            Reply-Message := "Wireless access - guest VLAN 999"
-        }
-    }
-
-    # ========================================
-    # PoC: Framed-Protocol 策略
-    # PPP(1) → 完整访问, SLIP(2) → 受限访问
-    # ========================================
     if (&Framed-Protocol == PPP) {
         update reply {
             Filter-Id := "corp-full-access"
@@ -96,10 +107,6 @@ post-auth {
         }
     }
 
-    # ========================================
-    # PoC: Tunnel-Type 策略
-    # L2TP(3) → 安全隧道, PPTP(1) → 弱隧道
-    # ========================================
     if (&Tunnel-Type == 3) {
         update reply {
             Tunnel-Type := 3
@@ -113,10 +120,6 @@ post-auth {
         }
     }
 
-    # ========================================
-    # PoC: Tunnel-Private-Group-Id 策略
-    # 基于请求中的 Group-Id 分配 VPN/VRF
-    # ========================================
     if (&Tunnel-Private-Group-Id == "corp-vpn") {
         update reply {
             Tunnel-Private-Group-Id := "corp-vpn"
@@ -130,21 +133,12 @@ post-auth {
         }
     }
 
-    # ========================================
-    # PoC: Tunnel-Server-Endpoint 策略
-    # 回显请求中的 Tunnel-Server-Endpoint
-    # ========================================
     if (&Tunnel-Server-Endpoint) {
         update reply {
             Tunnel-Server-Endpoint := "%{Tunnel-Server-Endpoint}"
             Reply-Message := "Tunnel endpoint set"
         }
     }
-
-    # ========================================
-    # PoC: Proxy-State 回显 (RFC 2865 要求)
-    # FreeRADIUS 默认就会回显，无需额外配置
-    # ========================================
 
     Post-Auth-Type REJECT {
         attr_filter.access_reject
